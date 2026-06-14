@@ -1,3 +1,13 @@
+export type SheetCell = {
+  text: string;
+  completed: boolean;
+  rowIndex: number;
+  columnIndex: number;
+  coordinate: string;
+  backgroundColor?: string;
+  textColor?: string;
+};
+
 export type SheetRow = {
   id: string;
   values: string[];
@@ -19,11 +29,12 @@ export type SheetData = {
   slug: string;
   headers: string[];
   rows: SheetRow[];
+  grid: SheetCell[][];
   totalTasks: number;
   completedTasks: number;
   completionPercent: number;
   points: number;
-  viewMode: "board" | "table";
+  viewMode: "grid" | "table";
   columnCount?: number;
 };
 
@@ -42,16 +53,6 @@ type DiscoveredTab = {
   name: string;
   gid: string;
   slug: string;
-};
-
-type ParsedCell = {
-  text: string;
-  rowIndex: number;
-  columnIndex: number;
-  coordinate: string;
-  backgroundColor?: string;
-  textColor?: string;
-  style: string;
 };
 
 type CacheEntry = {
@@ -120,16 +121,14 @@ async function getPublishedWorkbook(inputUrl: string, refreshSeconds: number): P
       )}&single=true&widget=true&headers=false`;
       const csvUrl = `${base}/pub?gid=${encodeURIComponent(tab.gid)}&single=true&output=csv`;
 
-      const [html, csv] = await Promise.all([
-        fetchText(tabHtmlUrl, refreshSeconds).catch(() => ""),
-        fetchText(csvUrl, refreshSeconds).catch(() => "")
-      ]);
-
+      const html = await fetchText(tabHtmlUrl, refreshSeconds).catch(() => "");
       const htmlSheet = html ? htmlToSheet(tab, html) : null;
-      if (htmlSheet && htmlSheet.rows.length > 0) {
+
+      if (htmlSheet && htmlSheet.grid.length > 0) {
         return htmlSheet;
       }
 
+      const csv = await fetchText(csvUrl, refreshSeconds);
       if (!csv || looksLikeHtml(csv)) {
         throw new Error(
           `Google did not return readable sheet data for tab "${tab.name}". Check the sheet is published to the web.`
@@ -217,14 +216,6 @@ function discoverTabs(html: string, sourceUrl: string): DiscoveredTab[] {
         addTab(gid, anchor);
       }
     }
-
-    const gidOnlyRegex =
-      /(?:#gid=|[?&]gid=|gid['"]?\s*[:=]\s*['"]?|sheetId['"]?\s*[:=]\s*['"]?)(\d+)/gi;
-    let gidMatch: RegExpExecArray | null;
-
-    while ((gidMatch = gidOnlyRegex.exec(candidateHtml)) !== null) {
-      addTab(gidMatch[1]);
-    }
   }
 
   const urlGid = sourceUrl.match(/[?&#]gid=(\d+)/)?.[1];
@@ -236,23 +227,83 @@ function discoverTabs(html: string, sourceUrl: string): DiscoveredTab[] {
 }
 
 function htmlToSheet(tab: DiscoveredTab, html: string): SheetData | null {
-  const cells = parseHtmlCells(html);
+  const parsedGrid = parseHtmlGrid(html);
 
-  if (cells.length === 0) {
+  if (parsedGrid.length === 0) {
     return null;
   }
 
-  const rows = groupCellsByRow(cells);
-  const firstRow = rows.find((row) => row.some((cell) => cell.text));
-
-  if (firstRow && looksLikeHeaderRow(firstRow.map((cell) => cell.text))) {
-    return htmlTableToSheet(tab, rows);
-  }
-
-  return htmlBoardToSheet(tab, cells);
+  const grid = trimGrid(parsedGrid);
+  return gridToSheet(tab, grid, "grid");
 }
 
-function parseHtmlCells(html: string): ParsedCell[] {
+function csvToSheet(tab: DiscoveredTab, csv: string): SheetData {
+  const parsed = parseCsv(csv);
+  const grid: SheetCell[][] = parsed.map((row, rowIndex) =>
+    row.map((value, columnIndex) => {
+      const text = value.trim();
+      return {
+        text,
+        completed: textLooksCompleted(text),
+        rowIndex,
+        columnIndex,
+        coordinate: `${columnName(columnIndex)}${rowIndex + 1}`
+      };
+    })
+  );
+
+  return gridToSheet(tab, trimGrid(grid), "grid");
+}
+
+function gridToSheet(tab: DiscoveredTab, grid: SheetCell[][], viewMode: "grid" | "table"): SheetData {
+  const contentCells = grid.flat().filter((cell) => cell.text.trim().length > 0);
+  const rows = grid
+    .filter((row) => row.some((cell) => cell.text.trim().length > 0))
+    .map((row, index) => {
+      const values = row.map((cell) => cell.text);
+      const firstContentCell = row.find((cell) => cell.text.trim().length > 0);
+      const completed = row.some((cell) => cell.completed);
+      const taskName = firstContentCell?.text || `Row ${index + 1}`;
+
+      return {
+        id: `${index}-${slugify(values.join("-") || taskName)}`,
+        values,
+        cells: values.reduce<Record<string, string>>((result, value, valueIndex) => {
+          result[`Column ${valueIndex + 1}`] = value;
+          return result;
+        }, {}),
+        taskName,
+        completed,
+        statusLabel: completed ? "Completed" : "Pending",
+        points: values.reduce((total, value) => total + extractPoints(value), 0),
+        rowIndex: firstContentCell?.rowIndex,
+        columnIndex: firstContentCell?.columnIndex,
+        coordinate: firstContentCell?.coordinate,
+        backgroundColor: firstContentCell?.backgroundColor,
+        textColor: firstContentCell?.textColor
+      } satisfies SheetRow;
+    });
+
+  const completedCells = contentCells.filter((cell) => cell.completed).length;
+  const columnCount = Math.max(0, ...grid.map((row) => row.length));
+
+  return {
+    name: tab.name,
+    gid: tab.gid,
+    slug: tab.slug,
+    headers: Array.from({ length: columnCount }, (_, index) => `Column ${index + 1}`),
+    rows,
+    grid,
+    totalTasks: contentCells.length,
+    completedTasks: completedCells,
+    completionPercent: contentCells.length === 0 ? 0 : Math.round((completedCells / contentCells.length) * 100),
+    points: rows.reduce((total, row) => total + row.points, 0),
+    viewMode,
+    columnCount
+  };
+}
+
+function parseHtmlGrid(html: string): SheetCell[][] {
   const classStyles = extractClassStyles(html);
   const tableMatch = html.match(/<table\b[\s\S]*?<\/table>/i);
 
@@ -260,12 +311,13 @@ function parseHtmlCells(html: string): ParsedCell[] {
     return [];
   }
 
-  const cells: ParsedCell[] = [];
+  const rows: SheetCell[][] = [];
   const rowRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
   let rowMatch: RegExpExecArray | null;
   let rowIndex = 0;
 
   while ((rowMatch = rowRegex.exec(tableMatch[0])) !== null) {
+    const row: SheetCell[] = [];
     const cellRegex = /<(td|th)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
     let cellMatch: RegExpExecArray | null;
     let columnIndex = 0;
@@ -283,274 +335,108 @@ function parseHtmlCells(html: string): ParsedCell[] {
       const text = cleanCellText(cellHtml);
       const backgroundColor = getStyleProperty(combinedStyle, "background-color");
       const textColor = getStyleProperty(combinedStyle, "color");
+      const completed = cellLooksCompleted({ text, style: combinedStyle, backgroundColor, textColor });
 
       for (let offset = 0; offset < span; offset += 1) {
-        cells.push({
+        row[columnIndex + offset] = {
           text,
+          completed,
           rowIndex,
           columnIndex: columnIndex + offset,
           coordinate: `${columnName(columnIndex + offset)}${rowIndex + 1}`,
           backgroundColor,
-          textColor,
-          style: combinedStyle
-        });
+          textColor
+        };
       }
 
       columnIndex += span;
     }
 
+    if (row.length > 0) {
+      rows.push(fillMissingCells(row, rowIndex));
+    }
+
     rowIndex += 1;
   }
 
-  return cells.filter((cell) => cell.text.length > 0);
+  return rows;
 }
 
-function htmlTableToSheet(tab: DiscoveredTab, rowsByIndex: ParsedCell[][]): SheetData {
-  const headerCells = rowsByIndex[0] || [];
-  const headers = normaliseHeaders(headerCells.map((cell) => cell.text));
-  const rows = rowsByIndex.slice(1).flatMap((cells, index) => {
-    if (!cells.some((cell) => cell.text.trim())) {
-      return [];
-    }
-
-    const values = headers.map((_, columnIndex) => cells.find((cell) => cell.columnIndex === columnIndex)?.text || "");
-    const row = makeSheetRow(headers, values, index);
-    const completedCell = cells.find((cell) => cellLooksCompleted(cell));
-
-    row.rowIndex = cells[0]?.rowIndex;
-    row.columnIndex = cells[0]?.columnIndex;
-    row.coordinate = cells[0]?.coordinate;
-
-    if (completedCell) {
-      row.completed = true;
-      row.statusLabel = "Completed";
-      row.backgroundColor = completedCell.backgroundColor;
-      row.textColor = completedCell.textColor;
-    }
-
-    return [row];
+function fillMissingCells(row: SheetCell[], rowIndex: number): SheetCell[] {
+  const width = row.length;
+  return Array.from({ length: width }, (_, columnIndex) => {
+    return (
+      row[columnIndex] || {
+        text: "",
+        completed: false,
+        rowIndex,
+        columnIndex,
+        coordinate: `${columnName(columnIndex)}${rowIndex + 1}`
+      }
+    );
   });
-
-  return makeSheetData(tab, headers, rows, "table");
 }
 
-function htmlBoardToSheet(tab: DiscoveredTab, cells: ParsedCell[]): SheetData {
-  const tileCells = cells.filter(isLikelyTileCell);
-  const rows = tileCells.map((cell, index) => {
-    const completed = cellLooksCompleted(cell);
-    const taskName = removeCompletionMarkers(cell.text) || cell.text;
-    const points = extractPoints(cell.text);
+function trimGrid(grid: SheetCell[][]): SheetCell[][] {
+  let top = 0;
+  let bottom = grid.length - 1;
 
-    return {
-      id: `${cell.coordinate}-${slugify(taskName)}-${index}`,
-      values: [taskName, completed ? "Completed" : "Pending"],
-      cells: { Tile: taskName, Status: completed ? "Completed" : "Pending" },
-      taskName,
-      completed,
-      statusLabel: completed ? "Completed" : "Pending",
-      points,
-      rowIndex: cell.rowIndex,
-      columnIndex: cell.columnIndex,
-      coordinate: cell.coordinate,
-      backgroundColor: cell.backgroundColor,
-      textColor: cell.textColor
-    } satisfies SheetRow;
-  });
-
-  const maxColumn = rows.reduce((max, row) => Math.max(max, row.columnIndex ?? 0), 0);
-  return makeSheetData(tab, ["Tile", "Status"], rows, "board", maxColumn + 1);
-}
-
-function csvToSheet(tab: DiscoveredTab, csv: string): SheetData {
-  const parsed = parseCsv(csv);
-  const firstRow = parsed[0] || [];
-
-  if (looksLikeHeaderRow(firstRow)) {
-    const headers = normaliseHeaders(firstRow);
-    const rows = parsed
-      .slice(1)
-      .filter(hasContent)
-      .map((values, index) => makeSheetRow(headers, values, index));
-
-    return makeSheetData(tab, headers, rows, "table");
+  while (top <= bottom && !grid[top]?.some((cell) => cell.text.trim())) {
+    top += 1;
   }
 
-  const rows = parsed.flatMap((row, rowIndex) =>
-    row.flatMap((value, columnIndex) => {
-      const text = value.trim();
-      if (!text || isIgnoredBoardText(text)) {
-        return [];
+  while (bottom >= top && !grid[bottom]?.some((cell) => cell.text.trim())) {
+    bottom -= 1;
+  }
+
+  const sliced = grid.slice(top, bottom + 1);
+
+  let right = 0;
+  for (const row of sliced) {
+    row.forEach((cell, index) => {
+      if (cell.text.trim()) {
+        right = Math.max(right, index);
       }
+    });
+  }
 
-      const completed = textLooksCompleted(text);
-      const taskName = removeCompletionMarkers(text) || text;
-
-      return [
-        {
-          id: `${columnName(columnIndex)}${rowIndex + 1}-${slugify(taskName)}`,
-          values: [taskName, completed ? "Completed" : "Pending"],
-          cells: { Tile: taskName, Status: completed ? "Completed" : "Pending" },
-          taskName,
-          completed,
-          statusLabel: completed ? "Completed" : "Pending",
-          points: extractPoints(text),
-          rowIndex,
-          columnIndex,
-          coordinate: `${columnName(columnIndex)}${rowIndex + 1}`
-        } satisfies SheetRow
-      ];
+  return sliced.map((row, newRowIndex) =>
+    Array.from({ length: right + 1 }, (_, index) => {
+      return (
+        row[index] || {
+          text: "",
+          completed: false,
+          rowIndex: newRowIndex,
+          columnIndex: index,
+          coordinate: `${columnName(index)}${newRowIndex + 1}`
+        }
+      );
     })
   );
-
-  const maxColumn = rows.reduce((max, row) => Math.max(max, row.columnIndex ?? 0), 0);
-  return makeSheetData(tab, ["Tile", "Status"], rows, "board", maxColumn + 1);
 }
 
-function makeSheetData(
-  tab: DiscoveredTab,
-  headers: string[],
-  rows: SheetRow[],
-  viewMode: "board" | "table",
-  columnCount?: number
-): SheetData {
-  const totalTasks = rows.length;
-  const completedTasks = rows.filter((row) => row.completed).length;
-  const points = rows.reduce((total, row) => total + row.points, 0);
-
-  return {
-    name: tab.name,
-    gid: tab.gid,
-    slug: tab.slug,
-    headers,
-    rows,
-    totalTasks,
-    completedTasks,
-    completionPercent: totalTasks === 0 ? 0 : Math.round((completedTasks / totalTasks) * 100),
-    points,
-    viewMode,
-    columnCount
-  };
-}
-
-function makeSheetRow(headers: string[], values: string[], index: number): SheetRow {
-  const cells = headers.reduce<Record<string, string>>((result, header, cellIndex) => {
-    result[header] = (values[cellIndex] || "").trim();
-    return result;
-  }, {});
-
-  const taskName = getTaskName(headers, cells, values, index);
-  const completed = isCompleted(headers, cells) || textLooksCompleted(values.join(" "));
-  const statusLabel = getStatusLabel(headers, cells, completed);
-  const points = getPoints(headers, cells) || extractPoints(values.join(" "));
-
-  return {
-    id: `${index}-${slugify(taskName)}`,
-    values: headers.map((header) => cells[header] || ""),
-    cells,
-    taskName,
-    completed,
-    statusLabel,
-    points
-  };
-}
-
-function getTaskName(headers: string[], cells: Record<string, string>, values: string[], index: number): string {
-  const preferredHeaders = ["task", "tile", "item", "drop", "challenge", "boss", "name", "objective", "requirement"];
-  const matchingHeader = headers.find((header) =>
-    preferredHeaders.some((preferred) => header.toLowerCase().includes(preferred))
-  );
-
-  if (matchingHeader && cells[matchingHeader]) {
-    return cells[matchingHeader];
-  }
-
-  return values.find((value) => value.trim().length > 0)?.trim() || `Row ${index + 1}`;
-}
-
-function getStatusLabel(headers: string[], cells: Record<string, string>, completed: boolean): string {
-  const statusHeader = headers.find((header) =>
-    ["status", "complete", "completed", "done", "approved", "submitted", "obtained"].some((term) =>
-      header.toLowerCase().includes(term)
-    )
-  );
-
-  if (statusHeader && cells[statusHeader]) {
-    return cells[statusHeader];
-  }
-
-  return completed ? "Completed" : "Pending";
-}
-
-function isCompleted(headers: string[], cells: Record<string, string>): boolean {
-  const statusHeaders = headers.filter((header) =>
-    ["status", "complete", "completed", "done", "approved", "submitted", "obtained"].some((term) =>
-      header.toLowerCase().includes(term)
-    )
-  );
-
-  for (const header of statusHeaders) {
-    const value = normaliseValue(cells[header]);
-
-    if (!value) {
-      continue;
-    }
-
-    if (
-      [
-        "complete",
-        "completed",
-        "done",
-        "yes",
-        "y",
-        "true",
-        "approved",
-        "submitted",
-        "claimed",
-        "obtained",
-        "received",
-        "x",
-        "✓",
-        "✔",
-        "✅",
-        "1"
-      ].includes(value)
-    ) {
-      return true;
-    }
-
-    if (["pending", "not started", "incomplete", "no", "n", "false", "rejected", "0"].includes(value)) {
-      return false;
-    }
-  }
-
-  return false;
-}
-
-function getPoints(headers: string[], cells: Record<string, string>): number {
-  const pointsHeader = headers.find((header) =>
-    ["points", "score", "value"].some((term) => header.toLowerCase().includes(term))
-  );
-
-  return pointsHeader ? parseNumber(cells[pointsHeader]) : 0;
-}
-
-function cellLooksCompleted(cell: ParsedCell): boolean {
-  if (textLooksCompleted(cell.text)) {
+function cellLooksCompleted(input: {
+  text: string;
+  style: string;
+  backgroundColor?: string;
+  textColor?: string;
+}): boolean {
+  if (textLooksCompleted(input.text)) {
     return true;
   }
 
-  const style = cell.style.toLowerCase();
+  const style = input.style.toLowerCase();
   if (style.includes("line-through")) {
     return true;
   }
 
-  const background = parseColour(cell.backgroundColor);
+  const background = parseColour(input.backgroundColor);
   if (!background) {
     return false;
   }
 
   const strongGreen = background.g > 120 && background.g > background.r + 25 && background.g > background.b + 25;
-  const strongRed = background.r > 120 && background.r > background.g + 25 && background.r > background.b + 25;
+  const strongRed = background.r > 150 && background.r > background.g + 35 && background.r > background.b + 35;
 
   return strongGreen || strongRed;
 }
@@ -586,75 +472,6 @@ function parseNumber(value: string | undefined): number {
   const raw = value?.replace(/,/g, "") || "";
   const parsed = Number.parseFloat(raw);
   return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function looksLikeHeaderRow(headers: string[]): boolean {
-  const text = headers.join(" ").toLowerCase();
-  const hasTaskColumn = ["task", "tile", "item", "drop", "challenge", "boss", "objective"].some((term) =>
-    text.includes(term)
-  );
-  const hasStatusColumn = ["status", "complete", "completed", "done", "approved"].some((term) =>
-    text.includes(term)
-  );
-  const hasStructuredColumn = ["points", "score", "submitted", "screenshot", "notes"].some((term) =>
-    text.includes(term)
-  );
-
-  return hasTaskColumn && (hasStatusColumn || hasStructuredColumn);
-}
-
-function isLikelyTileCell(cell: ParsedCell): boolean {
-  const text = cell.text.trim();
-  return Boolean(text && !isIgnoredBoardText(text));
-}
-
-function isIgnoredBoardText(value: string): boolean {
-  const normalised = normaliseValue(value).replace(/:$/, "");
-
-  if (!normalised || /^\d+$/.test(normalised)) {
-    return true;
-  }
-
-  return [
-    "task",
-    "tasks",
-    "tile",
-    "tiles",
-    "status",
-    "completed",
-    "complete",
-    "pending",
-    "points",
-    "score",
-    "team",
-    "teams",
-    "total",
-    "totals",
-    "overview",
-    "bingo"
-  ].includes(normalised);
-}
-
-function removeCompletionMarkers(value: string): string {
-  return value
-    .replace(/(^|\s)(✅|✓|✔|☑|\[x\])/gi, " ")
-    .replace(/^(complete|completed|done|approved)\s*[:\-]\s*/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function groupCellsByRow(cells: ParsedCell[]): ParsedCell[][] {
-  const grouped = new Map<number, ParsedCell[]>();
-
-  for (const cell of cells) {
-    const row = grouped.get(cell.rowIndex) || [];
-    row.push(cell);
-    grouped.set(cell.rowIndex, row);
-  }
-
-  return Array.from(grouped.entries())
-    .sort(([left], [right]) => left - right)
-    .map(([, row]) => row.sort((left, right) => left.columnIndex - right.columnIndex));
 }
 
 function extractClassStyles(html: string): Map<string, string> {
@@ -755,21 +572,6 @@ function parseCsv(csv: string): string[][] {
   currentRow.push(currentValue);
   rows.push(currentRow);
   return rows.filter((row) => row.some((value) => value.trim().length > 0));
-}
-
-function normaliseHeaders(headers: string[]): string[] {
-  const counts = new Map<string, number>();
-
-  return headers.map((header, index) => {
-    const baseName = header.trim() || `Column ${index + 1}`;
-    const count = counts.get(baseName) || 0;
-    counts.set(baseName, count + 1);
-    return count === 0 ? baseName : `${baseName} ${count + 1}`;
-  });
-}
-
-function hasContent(row: string[]): boolean {
-  return row.some((value) => value.trim().length > 0);
 }
 
 function normaliseValue(value: string | undefined): string {
@@ -882,13 +684,13 @@ function getRefreshSeconds(): number {
 function createDemoWorkbook(refreshSeconds: number, warning?: string): EventWorkbook {
   const tabs: SheetData[] = [
     createDemoSheet("Team A", "123", [
-      ["✅ Bandos Hilt", "Dexterous Prayer Scroll", "Enhanced Crystal Weapon Seed"],
-      ["Abyssal Whip", "✔ Zulrah Unique", "Chambers Purple"],
+      ["Bandos Hilt", "Dexterous Prayer Scroll", "Enhanced Crystal Weapon Seed"],
+      ["Abyssal Whip", "✓ Zulrah Unique", "Chambers Purple"],
       ["Armadyl Helmet", "Dragon Warhammer", "Complete: Theatre Purple"]
     ]),
     createDemoSheet("Team B", "456", [
       ["Abyssal Whip", "Zulrah Unique", "Chambers Purple"],
-      ["✅ Berserker Ring", "Godsword Shard", "Dragon Pickaxe"],
+      ["✓ Berserker Ring", "Godsword Shard", "Dragon Pickaxe"],
       ["Barrows Unique", "Completed: Zenyte", "DWH"]
     ])
   ];
