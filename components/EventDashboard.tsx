@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { EventWorkbook, SheetData, SheetRow } from "@/lib/sheets";
+import type { EventWorkbook, SheetCell, SheetData } from "@/lib/sheets";
 
 type FetchState = "loading" | "ready" | "error";
 
@@ -10,7 +10,6 @@ export default function EventDashboard() {
   const [status, setStatus] = useState<FetchState>("loading");
   const [activeSlug, setActiveSlug] = useState<string>("overview");
   const [query, setQuery] = useState("");
-  const [showTable, setShowTable] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadWorkbook = useCallback(async () => {
@@ -21,7 +20,6 @@ export default function EventDashboard() {
       }
 
       const data = (await response.json()) as EventWorkbook;
-
       setWorkbook(data);
       setStatus("ready");
       setError(null);
@@ -47,17 +45,6 @@ export default function EventDashboard() {
     return () => clearInterval(interval);
   }, [loadWorkbook, workbook]);
 
-  useEffect(() => {
-    if (!workbook) {
-      return;
-    }
-
-    if (workbook.refreshSeconds > 0) {
-      const root = document.documentElement;
-      root.style.setProperty("--refresh-seconds", `${workbook.refreshSeconds}s`);
-    }
-  }, [workbook]);
-
   const activeSheet = useMemo(
     () => workbook?.tabs.find((tab) => tab.slug === activeSlug),
     [activeSlug, workbook]
@@ -72,24 +59,6 @@ export default function EventDashboard() {
 
     return { totalTasks, completedTasks, points, completionPercent };
   }, [workbook]);
-
-  const filteredRows = useMemo(() => {
-    if (!activeSheet) {
-      return [];
-    }
-
-    const cleanQuery = query.trim().toLowerCase();
-    if (!cleanQuery) {
-      return activeSheet.rows;
-    }
-
-    return activeSheet.rows.filter((row) =>
-      [row.taskName, row.statusLabel, row.coordinate, ...row.values]
-        .join(" ")
-        .toLowerCase()
-        .includes(cleanQuery)
-    );
-  }, [activeSheet, query]);
 
   if (status === "loading" && !workbook) {
     return <LoadingScreen />;
@@ -110,18 +79,17 @@ export default function EventDashboard() {
           <p className="eyebrow">{workbook.clanName}</p>
           <h1>{workbook.eventName}</h1>
           <p className="hero-copy">
-            Live event progress powered by Google Sheets. Completed tiles are detected from
-            checkboxes, completed status values, tick symbols, strikethrough, and strong completed
-            cell colours.
+            Live event progress powered by Google Sheets. This version preserves the sheet layout
+            instead of guessing which cells are bingo tiles.
           </p>
         </div>
 
         <div className="hero-stat-card">
-          <span className="stat-label">Overall progress</span>
+          <span className="stat-label">Detected completed cells</span>
           <strong>{totals.completionPercent}%</strong>
           <ProgressBar value={totals.completionPercent} />
           <span className="stat-subtext">
-            {totals.completedTasks} of {totals.totalTasks} tracked tiles complete
+            {totals.completedTasks} of {totals.totalTasks} populated cells detected as complete
           </span>
         </div>
       </section>
@@ -136,8 +104,8 @@ export default function EventDashboard() {
 
       <section className="summary-grid" aria-label="Event summary">
         <SummaryCard label="Visible tabs" value={workbook.tabs.length.toString()} />
-        <SummaryCard label="Completed" value={totals.completedTasks.toString()} />
-        <SummaryCard label="Total tiles" value={totals.totalTasks.toString()} />
+        <SummaryCard label="Completed cells" value={totals.completedTasks.toString()} />
+        <SummaryCard label="Populated cells" value={totals.totalTasks.toString()} />
         <SummaryCard label="Points" value={totals.points.toString()} />
       </section>
 
@@ -155,10 +123,7 @@ export default function EventDashboard() {
               <button
                 className={activeSlug === tab.slug ? "tab active" : "tab"}
                 key={tab.gid}
-                onClick={() => {
-                  setActiveSlug(tab.slug);
-                  setShowTable(false);
-                }}
+                onClick={() => setActiveSlug(tab.slug)}
                 type="button"
               >
                 {tab.name}
@@ -167,25 +132,20 @@ export default function EventDashboard() {
           </div>
 
           {activeSlug !== "overview" ? (
-            <div className="toolbar-actions">
-              <input
-                aria-label="Search tiles"
-                className="search-input"
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search tiles..."
-                value={query}
-              />
-              <button className="ghost-button" onClick={() => setShowTable((value) => !value)} type="button">
-                {showTable ? "Show board" : "Show table"}
-              </button>
-            </div>
+            <input
+              aria-label="Search sheet"
+              className="search-input"
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search this tab..."
+              value={query}
+            />
           ) : null}
         </div>
 
         {activeSlug === "overview" ? (
           <Overview tabs={workbook.tabs} onSelectTab={setActiveSlug} />
         ) : activeSheet ? (
-          <SheetView rows={filteredRows} sheet={activeSheet} showTable={showTable} />
+          <SheetGrid sheet={activeSheet} query={query} />
         ) : (
           <p className="muted">The selected tab could not be found.</p>
         )}
@@ -210,8 +170,8 @@ function Overview({ tabs, onSelectTab }: { tabs: SheetData[]; onSelectTab: (slug
           </div>
           <ProgressBar value={tab.completionPercent} />
           <div className="team-card-meta">
-            <span>{tab.completedTasks} complete</span>
-            <span>{tab.totalTasks} tiles</span>
+            <span>{tab.completedTasks} detected complete</span>
+            <span>{tab.totalTasks} populated cells</span>
             <span>{tab.points} points</span>
           </div>
         </button>
@@ -220,8 +180,21 @@ function Overview({ tabs, onSelectTab }: { tabs: SheetData[]; onSelectTab: (slug
   );
 }
 
-function SheetView({ sheet, rows, showTable }: { sheet: SheetData; rows: SheetRow[]; showTable: boolean }) {
-  const boardRows = useMemo(() => rows.slice().sort(sortRowsByPosition), [rows]);
+function SheetGrid({ sheet, query }: { sheet: SheetData; query: string }) {
+  const cleanQuery = query.trim().toLowerCase();
+
+  const grid = useMemo(() => {
+    if (!cleanQuery) {
+      return sheet.grid;
+    }
+
+    return sheet.grid.map((row) =>
+      row.map((cell) => ({
+        ...cell,
+        hiddenBySearch: cell.text.trim() && !cell.text.toLowerCase().includes(cleanQuery)
+      }))
+    );
+  }, [cleanQuery, sheet.grid]);
 
   return (
     <div className="sheet-view">
@@ -232,70 +205,44 @@ function SheetView({ sheet, rows, showTable }: { sheet: SheetData; rows: SheetRo
         </div>
         <div className="sheet-progress">
           <strong>{sheet.completionPercent}%</strong>
-          <span>{sheet.completedTasks} complete</span>
+          <span>{sheet.completedTasks} detected complete</span>
         </div>
       </div>
 
       <ProgressBar value={sheet.completionPercent} />
 
-      {showTable ? <TableView rows={rows} sheet={sheet} /> : <TileBoard rows={boardRows} />}
-    </div>
-  );
-}
-
-function TileBoard({ rows }: { rows: SheetRow[] }) {
-  if (rows.length === 0) {
-    return <p className="muted">No tiles were found on this sheet tab.</p>;
-  }
-
-  return (
-    <div className="tile-board">
-      {rows.map((row) => (
-        <article className={row.completed ? "tile-card complete" : "tile-card"} key={row.id}>
-          <div className="tile-topline">
-            <span className="tile-coordinate">{row.coordinate || "Tile"}</span>
-            <StatusPill completed={row.completed} label={row.statusLabel} />
-          </div>
-          <h3>{renderValue(row.taskName)}</h3>
-          {row.points > 0 ? <span className="points-badge">{row.points} pts</span> : null}
-        </article>
-      ))}
-    </div>
-  );
-}
-
-function TableView({ sheet, rows }: { sheet: SheetData; rows: SheetRow[] }) {
-  return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Tile</th>
-            {sheet.headers
-              .filter((header) => !["Tile", "Status"].includes(header))
-              .map((header) => (
-                <th key={header}>{header}</th>
-              ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr className={row.completed ? "row-complete" : undefined} key={row.id}>
-              <td>
-                <StatusPill completed={row.completed} label={row.statusLabel} />
-              </td>
-              <td>{renderValue(row.taskName)}</td>
-              {sheet.headers
-                .filter((header) => !["Tile", "Status"].includes(header))
-                .map((header) => (
-                  <td key={header}>{renderValue(row.cells[header])}</td>
+      <div className="sheet-grid-wrap">
+        <table className="sheet-grid-table">
+          <tbody>
+            {grid.map((row, rowIndex) => (
+              <tr key={`row-${rowIndex}`}>
+                {row.map((cell, columnIndex) => (
+                  <SheetGridCell cell={cell} key={`${rowIndex}-${columnIndex}`} />
                 ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
+  );
+}
+
+function SheetGridCell({ cell }: { cell: SheetCell & { hiddenBySearch?: boolean | string } }) {
+  const className = [
+    "sheet-grid-cell",
+    cell.text.trim() ? "has-content" : "empty",
+    cell.completed ? "complete" : "",
+    cell.hiddenBySearch ? "search-dim" : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <td className={className} title={cell.coordinate}>
+      {cell.completed ? <span className="cell-check">✓</span> : null}
+      <span>{renderValue(cell.text)}</span>
+    </td>
   );
 }
 
@@ -315,10 +262,6 @@ function ProgressBar({ value }: { value: number }) {
       <div className="progress-fill" style={{ width: `${safeValue}%` }} />
     </div>
   );
-}
-
-function StatusPill({ completed, label }: { completed: boolean; label: string }) {
-  return <span className={completed ? "status-pill complete" : "status-pill"}>{completed ? "✓ " : ""}{label}</span>;
 }
 
 function LoadingScreen() {
@@ -342,7 +285,7 @@ function ErrorScreen({ message }: { message: string }) {
 
 function renderValue(value: string) {
   if (!value) {
-    return <span className="muted">—</span>;
+    return "";
   }
 
   if (/^https?:\/\//i.test(value)) {
@@ -354,17 +297,6 @@ function renderValue(value: string) {
   }
 
   return value;
-}
-
-function sortRowsByPosition(left: SheetRow, right: SheetRow): number {
-  const leftRow = left.rowIndex ?? 0;
-  const rightRow = right.rowIndex ?? 0;
-
-  if (leftRow !== rightRow) {
-    return leftRow - rightRow;
-  }
-
-  return (left.columnIndex ?? 0) - (right.columnIndex ?? 0);
 }
 
 function formatDateTime(value: string): string {
