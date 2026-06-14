@@ -675,7 +675,7 @@ function extractClassStyles(html: string): Map<string, string> {
 }
 
 function getAttribute(attributes: string, name: string): string | undefined {
-  const regex = new RegExp(`${name}=(['"])({0,0}.*?)\\1`, "i");
+  const regex = new RegExp(`${name}=(['"])(.*?)\\1`, "i");
   return attributes.match(regex)?.[2];
 }
 
